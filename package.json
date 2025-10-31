@@ -1,16 +1,20 @@
 {
-  "name": "sqlwmscml",
+  "name": "mysql-data-utility",
   "version": "1.0.0",
-  "description": "",
-  "main": "test-connection.js",
+  "description": "Node.js utility for transferring schema and data between MySQL databases",
+  "main": "index.js",
   "scripts": {
+    "start": "node index.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "keywords": [],
+  "keywords": ["mysql", "database", "data-transfer", "schema-copy"],
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "mysql2": "^3.15.3"
+    "mysql2": "^3.6.5",
+    "dotenv": "^16.3.1"
   },
-  "devDependencies": {}
+  "engines": {
+    "node": ">=18.0.0"
+  }
 }
