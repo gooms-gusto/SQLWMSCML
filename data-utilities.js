@@ -117,6 +117,18 @@ async function copyTableStructure(sourceTableName, targetTableName) {
         const actualSourceTableName = sourceTableCheck[0].TABLE_NAME;
         console.log(`[INFO] Found source table: ${actualSourceTableName}`);
 
+        // Check if target table already exists
+        const [targetTableCheck] = await db2Conn.execute(
+            `SELECT TABLE_NAME FROM information_schema.TABLES
+             WHERE TABLE_SCHEMA = DATABASE() AND UPPER(TABLE_NAME) = UPPER(?)`,
+            [targetTableName]
+        );
+
+        if (targetTableCheck.length > 0) {
+            const actualTargetTableName = targetTableCheck[0].TABLE_NAME;
+            throw new Error(`Target table ${actualTargetTableName} already exists. Use sync-table to sync data or copy-data to copy data to existing table.`);
+        }
+
         const [createTableResult] = await db1Conn.execute(`SHOW CREATE TABLE \`${actualSourceTableName}\``);
 
         let createTableSQL = createTableResult[0]['Create Table'];
@@ -168,8 +180,10 @@ async function copyTableStructure(sourceTableName, targetTableName) {
                     // Ignore if we can't check the setting
                 }
             }
+            return actualTableName; // Return the actual table name
         } else {
             console.log(`[ERROR] Table creation failed - table not found in database`);
+            return targetTableName; // Fallback
         }
 
     } catch (error) {
@@ -181,6 +195,7 @@ async function copyTableStructure(sourceTableName, targetTableName) {
     }
 }
 
+
 async function copyTableData(sourceTableName, targetTableName, limit) {
     let db1Conn = null;
     let db2Conn = null;
@@ -190,6 +205,27 @@ async function copyTableData(sourceTableName, targetTableName, limit) {
 
         db1Conn = await getDB1Pool().getConnection();
         db2Conn = await getDB2Pool().getConnection();
+
+        // Check if target table exists and has data
+        const [targetTableCheck] = await db2Conn.execute(
+            `SELECT COUNT(*) as count FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?`,
+            [targetTableName]
+        );
+
+        if (targetTableCheck[0].count === 0) {
+            throw new Error(`Target table ${targetTableName} does not exist. Use copy-table command to create structure first.`);
+        }
+
+        // Check if target table has existing data
+        const [targetDataCheck] = await db2Conn.execute(`SELECT COUNT(*) as count FROM \`${targetTableName}\``);
+
+        if (targetDataCheck[0].count > 0) {
+            console.log(`[INFO] Target table ${targetTableName} has ${targetDataCheck[0].count} existing records.`);
+            console.log(`[INFO] copy-data only works with empty target tables. Use sync-table to sync data to existing tables.`);
+            return { copiedRows: 0, skippedRows: targetDataCheck[0].count };
+        }
+
+        console.log(`[INFO] Target table ${targetTableName} is empty. Starting data copy...`);
 
         let selectQuery = `SELECT * FROM \`${sourceTableName}\``;
         if (limit && Number.isInteger(limit) && limit > 0) {
@@ -204,20 +240,36 @@ async function copyTableData(sourceTableName, targetTableName, limit) {
             return { copiedRows: 0 };
         }
 
+        console.log(`[INFO] Found ${rows.length} records to copy from source table`);
+
         const columns = fields.map(f => f.name);
         const colNamesSQL = columns.map(c => `\`${c}\``).join(', ');
-        const values = rows.map(row => columns.map(col => row[col]));
 
-        const insertQuery = `INSERT INTO \`${targetTableName}\` (${colNamesSQL}) VALUES ?`;
+        // Use chunking for large datasets
+        const CHUNK_SIZE = 1000;
+        let totalInserted = 0;
 
         await db2Conn.beginTransaction();
 
         try {
-            const [result] = await db2Conn.execute(insertQuery, [values]);
-            await db2Conn.commit();
+            for (let i = 0; i < rows.length; i += CHUNK_SIZE) {
+                const chunk = rows.slice(i, i + CHUNK_SIZE);
+                const values = chunk.map(row => columns.map(col => row[col]));
 
-            console.log(`[SUCCESS] Copied ${result.affectedRows} rows from ${sourceTableName} to ${targetTableName}`);
-            return { copiedRows: result.affectedRows };
+                const valuePlaceholders = values.map(() => `(${columns.map(() => '?').join(', ')})`).join(', ');
+                const flatValues = values.flat();
+
+                const insertQuery = `INSERT INTO \`${targetTableName}\` (${colNamesSQL}) VALUES ${valuePlaceholders}`;
+
+                const [result] = await db2Conn.execute(insertQuery, flatValues);
+                totalInserted += result.affectedRows;
+
+                console.log(`[INFO] Inserted batch ${Math.floor(i / CHUNK_SIZE) + 1}: ${result.affectedRows} rows`);
+            }
+
+            await db2Conn.commit();
+            console.log(`[SUCCESS] Copied ${totalInserted} rows from ${sourceTableName} to ${targetTableName}`);
+            return { copiedRows: totalInserted };
 
         } catch (insertError) {
             await db2Conn.rollback();
@@ -347,23 +399,34 @@ async function copyCustomQuery(selectQuery, targetTableName) {
             }
         }
 
-        // Prepare data for bulk insert
+        // Prepare data for bulk insert with chunking
         const values = rows.map(row => columns.map(col => row[col]));
 
-        // Build INSERT query with individual value placeholders
-        const valuePlaceholders = values.map(() => `(${columns.map(() => '?').join(', ')})`).join(', ');
-        const flatValues = values.flat();
-
-        const insertQuery = `INSERT INTO \`${targetTableName}\` (${colNamesSQL}) VALUES ${valuePlaceholders}`;
+        // Define chunk size (1000 rows per batch to stay well under MySQL's placeholder limit)
+        const CHUNK_SIZE = 1000;
+        let totalInserted = 0;
 
         await db2Conn.beginTransaction();
 
         try {
-            const [result] = await db2Conn.execute(insertQuery, flatValues);
-            await db2Conn.commit();
+            for (let i = 0; i < values.length; i += CHUNK_SIZE) {
+                const chunk = values.slice(i, i + CHUNK_SIZE);
 
-            console.log(`[SUCCESS] Inserted ${result.affectedRows} rows into ${targetTableName}`);
-            return { copiedRows: result.affectedRows };
+                // Build INSERT query for this chunk
+                const valuePlaceholders = chunk.map(() => `(${columns.map(() => '?').join(', ')})`).join(', ');
+                const flatValues = chunk.flat();
+
+                const insertQuery = `INSERT INTO \`${targetTableName}\` (${colNamesSQL}) VALUES ${valuePlaceholders}`;
+
+                const [result] = await db2Conn.execute(insertQuery, flatValues);
+                totalInserted += result.affectedRows;
+
+                console.log(`[INFO] Inserted batch ${Math.floor(i / CHUNK_SIZE) + 1}: ${result.affectedRows} rows`);
+            }
+
+            await db2Conn.commit();
+            console.log(`[SUCCESS] Inserted total of ${totalInserted} rows into ${targetTableName}`);
+            return { copiedRows: totalInserted };
 
         } catch (insertError) {
             await db2Conn.rollback();
@@ -379,8 +442,296 @@ async function copyCustomQuery(selectQuery, targetTableName) {
     }
 }
 
+async function syncTable(tableName) {
+    let db1Conn = null;
+    let db2Conn = null;
+
+    try {
+        console.log(`[INFO] Starting table sync: ${tableName} from DB1 to DB2`);
+        console.log(`[INFO] Sync direction: DB1 → DB2 (copy only missing records)`);
+
+        db1Conn = await getDB1Pool().getConnection();
+        db2Conn = await getDB2Pool().getConnection();
+
+        // Check if source table exists in DB1
+        const [sourceTableCheck] = await db1Conn.execute(
+            `SELECT TABLE_NAME FROM information_schema.TABLES
+             WHERE TABLE_SCHEMA = DATABASE() AND UPPER(TABLE_NAME) = UPPER(?)`,
+            [tableName]
+        );
+
+        if (sourceTableCheck.length === 0) {
+            throw new Error(`[DB1_ERROR] Source table ${tableName} not found in DB1`);
+        }
+
+        const actualSourceTableName = sourceTableCheck[0].TABLE_NAME;
+        console.log(`[INFO] Found source table in DB1: ${actualSourceTableName}`);
+
+        // Check if target table exists in DB2
+        const [targetTableCheck] = await db2Conn.execute(
+            `SELECT TABLE_NAME FROM information_schema.TABLES
+             WHERE TABLE_SCHEMA = DATABASE() AND UPPER(TABLE_NAME) = UPPER(?)`,
+            [tableName]
+        );
+
+        if (targetTableCheck.length === 0) {
+            console.log(`[INFO] Target table ${tableName} not found in DB2. Creating table structure first...`);
+            await copyTableStructure(actualSourceTableName, tableName);
+            console.log(`[INFO] Table structure created. Now syncing data...`);
+        } else {
+            const actualTargetTableName = targetTableCheck[0].TABLE_NAME;
+            console.log(`[INFO] Found target table in DB2: ${actualTargetTableName}`);
+        }
+
+        // Get primary key columns from source table
+        const [sourceColumns] = await db1Conn.execute(
+            `SELECT COLUMN_NAME, COLUMN_KEY FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION`,
+            [actualSourceTableName]
+        );
+
+        const primaryKeyColumns = sourceColumns
+            .filter(col => col.COLUMN_KEY === 'PRI')
+            .map(col => col.COLUMN_NAME);
+
+        if (primaryKeyColumns.length === 0) {
+            console.log(`[WARNING] No primary key found in ${actualSourceTableName}. Sync will use full column comparison.`);
+            return await syncTableWithoutPrimaryKey(actualSourceTableName, tableName, db1Conn, db2Conn, sourceColumns);
+        }
+
+        console.log(`[INFO] Using primary key columns for sync: ${primaryKeyColumns.join(', ')}`);
+
+        // Start the sync process with batching
+        await performSyncWithBatching(
+            actualSourceTableName,
+            tableName,
+            db1Conn,
+            db2Conn,
+            primaryKeyColumns,
+            sourceColumns.map(col => col.COLUMN_NAME)
+        );
+
+    } catch (error) {
+        console.error(`[ERROR] Failed to sync table ${tableName}: ${error.message}`);
+        throw error;
+    } finally {
+        if (db1Conn) db1Conn.release();
+        if (db2Conn) db2Conn.release();
+    }
+}
+
+async function performSyncWithBatching(sourceTableName, targetTableName, db1Conn, db2Conn, primaryKeyColumns, allColumns) {
+    const BATCH_SIZE = 1000;
+    let totalSynced = 0;
+    let batchNumber = 1;
+
+    // Build JOIN condition
+    const joinConditions = primaryKeyColumns.map(col =>
+        `s.\`${col}\` = t.\`${col}\``
+    ).join(' AND ');
+
+    // Count total missing records first
+    console.log(`[INFO] Counting total records to sync...`);
+
+    // Debug: Check row counts in both tables
+    const [sourceCountResult] = await db1Conn.execute(`SELECT COUNT(*) as count FROM \`${sourceTableName}\``);
+    const [targetCountResult] = await db2Conn.execute(`SELECT COUNT(*) as count FROM \`${targetTableName}\``);
+    console.log(`[DEBUG] Source table (${sourceTableName}) has ${sourceCountResult[0].count} rows`);
+    console.log(`[DEBUG] Target table (${targetTableName}) has ${targetCountResult[0].count} rows`);
+
+    let totalMissing;
+
+    // If target table is empty, sync all records from source
+    if (targetCountResult[0].count === 0) {
+        console.log(`[INFO] Target table is empty. Will sync all ${sourceCountResult[0].count} records from source.`);
+        totalMissing = sourceCountResult[0].count;
+    } else {
+        // Use LEFT JOIN to find missing records
+        const countQuery = `
+            SELECT COUNT(*) as count FROM \`${sourceTableName}\` s
+            LEFT JOIN \`${targetTableName}\` t ON ${joinConditions}
+            WHERE t.\`${primaryKeyColumns[0]}\` IS NULL
+        `;
+        console.log(`[DEBUG] Sync query: ${countQuery}`);
+        const [countResult] = await db1Conn.execute(countQuery);
+        totalMissing = countResult[0].count;
+        console.log(`[DEBUG] Missing records count: ${totalMissing}`);
+    }
+
+    if (totalMissing === 0) {
+        console.log(`[SUCCESS] Table ${targetTableName} is already up to date. No records to sync.`);
+        return { syncedRows: 0, totalBatches: 0 };
+    }
+
+    console.log(`[INFO] Found ${totalMissing} records to sync from ${sourceTableName} to ${targetTableName}`);
+    console.log(`[INFO] Processing in batches of ${BATCH_SIZE} rows...`);
+
+    // Get column names for INSERT
+    const columnNames = allColumns;
+    const colNamesSQL = columnNames.map(c => `\`${c}\``).join(', ');
+
+    // Process in batches
+    let offset = 0;
+    const totalBatches = Math.ceil(totalMissing / BATCH_SIZE);
+
+    while (offset < totalMissing) {
+        console.log(`[BATCH ${batchNumber}/${totalBatches}] Syncing up to ${BATCH_SIZE} records...`);
+
+        // Get missing records for this batch
+        let batchQuery;
+
+        if (targetCountResult[0].count === 0) {
+            // Target table is empty, get all records from source
+            batchQuery = `
+                SELECT * FROM \`${sourceTableName}\`
+                LIMIT ${BATCH_SIZE} OFFSET ${(batchNumber - 1) * BATCH_SIZE}
+            `;
+        } else {
+            // Target table has data, find missing records using LEFT JOIN
+            batchQuery = `
+                SELECT s.* FROM \`${sourceTableName}\` s
+                LEFT JOIN \`${targetTableName}\` t ON ${joinConditions}
+                WHERE t.\`${primaryKeyColumns[0]}\` IS NULL
+                LIMIT ${BATCH_SIZE}
+            `;
+        }
+
+        console.log(`[DEBUG] Batch ${batchNumber} query: ${batchQuery}`);
+        const [rows] = await db1Conn.execute(batchQuery);
+        console.log(`[DEBUG] Batch ${batchNumber} found ${rows.length} rows to sync`);
+
+        if (rows.length === 0) {
+            console.log(`[BATCH ${batchNumber}] No more records to sync.`);
+            break;
+        }
+
+        // Prepare data for insertion
+        const values = rows.map(row => columnNames.map(col => row[col]));
+        const valuePlaceholders = values.map(() => `(${columnNames.map(() => '?').join(', ')})`).join(', ');
+        const flatValues = values.flat();
+
+        const insertQuery = `INSERT INTO \`${targetTableName}\` (${colNamesSQL}) VALUES ${valuePlaceholders}`;
+
+        // Execute batch insertion
+        await db2Conn.beginTransaction();
+
+        try {
+            const [result] = await db2Conn.execute(insertQuery, flatValues);
+            await db2Conn.commit();
+
+            totalSynced += result.affectedRows;
+            console.log(`[BATCH ${batchNumber}] Synced ${result.affectedRows} records (Total: ${totalSynced}/${totalMissing})`);
+
+            if (result.affectedRows === 0) {
+                console.log(`[WARNING] Batch ${batchNumber} inserted 0 records. This might indicate a data issue.`);
+            }
+
+        } catch (insertError) {
+            await db2Conn.rollback();
+            console.error(`[ERROR] Batch ${batchNumber} failed: ${insertError.message}`);
+            throw insertError;
+        }
+
+        offset += rows.length;
+        batchNumber++;
+
+        // Small delay to prevent overwhelming the database
+        await new Promise(resolve => setTimeout(resolve, 10));
+    }
+
+    console.log(`[SUCCESS] Table sync completed! Synced ${totalSynced} records from ${sourceTableName} to ${targetTableName}`);
+    return { syncedRows: totalSynced, totalBatches: batchNumber - 1 };
+}
+
+async function syncTableWithoutPrimaryKey(sourceTableName, targetTableName, db1Conn, db2Conn, sourceColumns) {
+    console.log(`[INFO] Performing full column comparison sync for ${sourceTableName}`);
+
+    const BATCH_SIZE = 1000;
+    const columnNames = sourceColumns.map(col => col.COLUMN_NAME);
+    const colNamesSQL = columnNames.map(c => `\`${c}\``).join(', ');
+
+    // Get all records from source
+    const [allSourceRecords] = await db1Conn.execute(`SELECT * FROM \`${sourceTableName}\``);
+
+    if (allSourceRecords.length === 0) {
+        console.log(`[INFO] No records found in source table ${sourceTableName}`);
+        return { syncedRows: 0, totalBatches: 0 };
+    }
+
+    console.log(`[INFO] Checking ${allSourceRecords.length} records against target table...`);
+
+    let recordsToSync = [];
+    let processed = 0;
+
+    for (const sourceRecord of allSourceRecords) {
+        // Build WHERE clause for this record
+        const whereConditions = columnNames.map(col => `\`${col}\` = ?`).join(' AND ');
+        const whereValues = columnNames.map(col => sourceRecord[col]);
+
+        // Check if record exists in target
+        const [existingCheck] = await db2Conn.execute(
+            `SELECT COUNT(*) as count FROM \`${targetTableName}\` WHERE ${whereConditions}`,
+            whereValues
+        );
+
+        if (existingCheck[0].count === 0) {
+            recordsToSync.push(sourceRecord);
+        }
+
+        processed++;
+        if (processed % 1000 === 0) {
+            console.log(`[PROGRESS] Checked ${processed}/${allSourceRecords.length} records...`);
+        }
+    }
+
+    if (recordsToSync.length === 0) {
+        console.log(`[SUCCESS] Table ${targetTableName} is already up to date. No records to sync.`);
+        return { syncedRows: 0, totalBatches: 0 };
+    }
+
+    console.log(`[INFO] Found ${recordsToSync.length} records to sync. Processing in batches of ${BATCH_SIZE}...`);
+
+    // Insert in batches
+    let totalSynced = 0;
+    const totalBatches = Math.ceil(recordsToSync.length / BATCH_SIZE);
+
+    for (let i = 0; i < recordsToSync.length; i += BATCH_SIZE) {
+        const batch = recordsToSync.slice(i, i + BATCH_SIZE);
+        const batchNumber = Math.floor(i / BATCH_SIZE) + 1;
+
+        console.log(`[BATCH ${batchNumber}/${totalBatches}] Syncing ${batch.length} records...`);
+
+        const values = batch.map(row => columnNames.map(col => row[col]));
+        const valuePlaceholders = values.map(() => `(${columnNames.map(() => '?').join(', ')})`).join(', ');
+        const flatValues = values.flat();
+
+        const insertQuery = `INSERT INTO \`${targetTableName}\` (${colNamesSQL}) VALUES ${valuePlaceholders}`;
+
+        await db2Conn.beginTransaction();
+
+        try {
+            const [result] = await db2Conn.execute(insertQuery, flatValues);
+            await db2Conn.commit();
+
+            totalSynced += result.affectedRows;
+            console.log(`[BATCH ${batchNumber}] Synced ${result.affectedRows} records (Total: ${totalSynced}/${recordsToSync.length})`);
+
+        } catch (insertError) {
+            await db2Conn.rollback();
+            console.error(`[ERROR] Batch ${batchNumber} failed: ${insertError.message}`);
+            throw insertError;
+        }
+
+        await new Promise(resolve => setTimeout(resolve, 10));
+    }
+
+    console.log(`[SUCCESS] Table sync completed! Synced ${totalSynced} records from ${sourceTableName} to ${targetTableName}`);
+    return { syncedRows: totalSynced, totalBatches };
+}
+
 module.exports = {
     copyTableStructure,
     copyTableData,
-    copyCustomQuery
+    copyCustomQuery,
+    syncTable
 };

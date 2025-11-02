@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 const { initializeConnections, closeConnections } = require('./database');
-const { copyTableStructure, copyTableData, copyCustomQuery } = require('./data-utilities');
+const { copyTableStructure, copyTableData, copyCustomQuery, syncTable } = require('./data-utilities');
 
 function printUsage() {
     console.log(`
@@ -11,23 +11,27 @@ Node.js utility for transferring schema and data between MySQL databases
 
 Commands:
 
-1. Copy table structure only:
+1. Copy table structure only (target table must NOT exist):
    node index.js copy-structure <source_table> <target_table>
 
-2. Copy table data only (assumes target table exists):
+2. Copy table data only (target table must exist and be EMPTY):
    node index.js copy-data <source_table> <target_table> [limit]
 
-3. Copy both structure and data:
+3. Copy both structure and data (target table must NOT exist):
    node index.js copy-table <source_table> <target_table> [limit]
 
 4. Execute custom query and insert results:
    node index.js custom-query "<SELECT_statement>" <target_table>
 
+5. Sync table data from DB1 to DB2 (copy only missing records):
+   node index.js sync-table <table_name>
+
 Examples:
-  node index.js copy-structure users users_backup
-  node index.js copy-data users users_backup 1000
-  node index.js copy-table users users_copy
+  node index.js copy-structure users users_backup      # Creates new empty table
+  node index.js copy-data users users_backup 1000      # Copies data to existing empty table
+  node index.js copy-table users users_copy             # Creates new table and copies all data
   node index.js custom-query "SELECT * FROM users WHERE active = 1" active_users
+  node index.js sync-table users                        # Syncs missing records between existing tables
 `);
 }
 
@@ -82,6 +86,14 @@ async function main() {
                     process.exit(1);
                 }
                 await copyCustomQuery(args[1], args[2]);
+                break;
+
+            case 'sync-table':
+                if (args.length !== 2) {
+                    console.error('[ERROR] sync-table requires table_name argument');
+                    process.exit(1);
+                }
+                await syncTable(args[1]);
                 break;
 
             default:

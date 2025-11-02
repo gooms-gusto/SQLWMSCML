@@ -8,7 +8,9 @@ const db1Config = {
     password: process.env.DB1_PASSWORD,
     database: process.env.DB1_DATABASE,
     connectionLimit: 10,
-    queueLimit: 0
+    queueLimit: 0,
+    connectTimeout: 60000,
+    acquireTimeout: 60000
 };
 
 const db2Config = {
@@ -18,7 +20,9 @@ const db2Config = {
     password: process.env.DB2_PASSWORD,
     database: process.env.DB2_DATABASE,
     connectionLimit: 10,
-    queueLimit: 0
+    queueLimit: 0,
+    connectTimeout: 60000,
+    acquireTimeout: 60000
 };
 
 let db1Pool = null;
