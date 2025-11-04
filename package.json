@@ -5,6 +5,8 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
+    "backup": "node backup-restore-app.js",
+    "backup-large": "node large-data-backup.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": ["mysql", "database", "data-transfer", "schema-copy"],
